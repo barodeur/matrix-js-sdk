@@ -835,6 +835,116 @@ describe("MatrixClient", function () {
             await expect(client._unstable_sendScheduledDelayedEvent("anyDelayId")).rejects.toThrow(errorMessage);
         });
 
+        describe("in an encrypted room", () => {
+            const encryptedContent = {
+                algorithm: "m.megolm.v1.aes-sha2",
+                ciphertext: "opaque",
+                session_id: "session",
+            };
+            let mockCrypto: Mocked<CryptoBackend>;
+
+            beforeEach(() => {
+                const mockRoom = {
+                    roomId,
+                    getMyMembership: () => KnownMembership.Join,
+                    hasEncryptionStateEvent: vi.fn().mockReturnValue(true),
+                    updatePendingEvent: vi.fn(),
+                    getThread: vi.fn(),
+                    getPendingEvents: vi.fn().mockReturnValue([]),
+                } as unknown as Room;
+                client.getRoom = () => mockRoom;
+                mockCrypto = {
+                    isEncryptionEnabledInRoom: vi.fn().mockResolvedValue(true),
+                    encryptEvent: vi.fn(async (event: MatrixEvent) => {
+                        event.makeEncrypted(EventType.RoomMessageEncrypted, encryptedContent, "curve", "ed");
+                    }),
+                    stop: vi.fn(),
+                } as unknown as Mocked<CryptoBackend>;
+                client["cryptoBackend"] = mockCrypto;
+            });
+
+            it("encrypts the delayed event before sending it", async () => {
+                const txnId = client.makeTxnId();
+                httpLookups = [
+                    {
+                        method: "PUT",
+                        path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.encrypted/${txnId}`,
+                        expectQueryParams: realTimeoutDelayOpts,
+                        expectBody: encryptedContent,
+                        data: { delay_id: "id1" },
+                    },
+                ];
+
+                await client._unstable_sendDelayedEvent(
+                    roomId,
+                    timeoutDelayOpts,
+                    null,
+                    EventType.RoomMessage,
+                    { ...content },
+                    txnId,
+                );
+
+                expect(mockCrypto.encryptEvent).toHaveBeenCalledTimes(1);
+                const [event] = mockCrypto.encryptEvent.mock.calls[0];
+                expect(event.getClearContent()).toEqual(content);
+                expect(httpLookups).toHaveLength(0);
+            });
+
+            it("does not touch the pending event list", async () => {
+                const txnId = client.makeTxnId();
+                httpLookups = [
+                    {
+                        method: "PUT",
+                        path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.encrypted/${txnId}`,
+                        expectQueryParams: realTimeoutDelayOpts,
+                        data: { delay_id: "id1" },
+                    },
+                ];
+
+                await client._unstable_sendDelayedEvent(
+                    roomId,
+                    timeoutDelayOpts,
+                    null,
+                    EventType.RoomMessage,
+                    { ...content },
+                    txnId,
+                );
+
+                const room = client.getRoom(roomId)!;
+                expect(room.updatePendingEvent).not.toHaveBeenCalled();
+            });
+
+            it("leaves sticky delayed events unencrypted", async () => {
+                unstableFeatures["org.matrix.msc4354"] = true;
+                const txnId = client.makeTxnId();
+                httpLookups = [
+                    {
+                        method: "PUT",
+                        path: `/rooms/${encodeURIComponent(roomId)}/send/m.room.message/${txnId}`,
+                        expectQueryParams: {
+                            ...realTimeoutDelayOpts,
+                            "org.matrix.msc4354.sticky_duration_ms": 5000,
+                        },
+                        expectBody: content,
+                        data: { delay_id: "id1" },
+                    },
+                ];
+
+                await client._unstable_sendStickyDelayedEvent(
+                    roomId,
+                    5000,
+                    timeoutDelayOpts,
+                    null,
+                    EventType.RoomMessage,
+                    { ...content },
+                    txnId,
+                );
+
+                expect(mockCrypto.encryptEvent).not.toHaveBeenCalled();
+                expect(httpLookups).toHaveLength(0);
+            });
+        });
+
         // eslint-disable-next-line @vitest/expect-expect
         it("works with null threadId", async () => {
             httpLookups = [];

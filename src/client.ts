@@ -568,6 +568,7 @@ export const UNSTABLE_MSC2666_QUERY_MUTUAL_ROOMS = "uk.half-shot.msc2666.query_m
 
 export const UNSTABLE_MSC4140_DELAYED_EVENTS = "org.matrix.msc4140";
 export const UNSTABLE_MSC4354_STICKY_EVENTS = "org.matrix.msc4354";
+const UNSTABLE_MSC4354_STICKY_DURATION_QUERY_PARAM = `${UNSTABLE_MSC4354_STICKY_EVENTS}.sticky_duration_ms`;
 
 export const UNSTABLE_MSC4133_EXTENDED_PROFILES = "uk.tcpip.msc4133";
 export const STABLE_MSC4133_EXTENDED_PROFILES = "uk.tcpip.msc4133.stable";
@@ -2913,8 +2914,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         queryDict?: QueryDict,
     ): Promise<ISendEventResponse>;
     /**
-     * Simply sends a delayed event without encrypting it.
-     * TODO: Allow encrypted delayed events, and encrypt them properly
+     * Encrypts a delayed event if the room is encrypted, then sends it to the delayed events endpoint.
+     *
+     * Delayed events are not tracked as pending events and do not go through the scheduler:
+     * the homeserver holds them until they are due. Sticky events (MSC4354) are left unencrypted,
+     * as they are today when sent immediately.
      * @param delayOpts - Properties of the delay for this event.
      * @returns returns a promise which resolves with the result of the delayed send request
      */
@@ -2932,6 +2936,9 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     ): Promise<ISendEventResponse | SendDelayedEventResponse> {
         let queryOpts = queryDict;
         if (delayOptsOrQuery && isSendDelayedEventRequestOpts(delayOptsOrQuery)) {
+            if (!isStickyEventQuery(queryOpts)) {
+                await this.encryptEventIfNeeded(event, room ?? undefined, false);
+            }
             return this.sendEventHttpRequest(event, delayOptsOrQuery, queryOpts);
         } else if (!queryOpts) {
             queryOpts = delayOptsOrQuery;
@@ -2999,7 +3006,16 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         }
     }
 
-    private async encryptEventIfNeeded(event: MatrixEvent, room?: Room): Promise<void> {
+    /**
+     * Encrypt the event in place if the room it is destined for is encrypted.
+     *
+     * @param event - the event to encrypt
+     * @param room - the room the event will be sent to; nothing happens if unknown
+     * @param updatePendingStatus - whether to mark the event as ENCRYPTING in the room's pending
+     *   event list while it is being encrypted. Pass `false` for events which are not pending
+     *   events, such as delayed events.
+     */
+    private async encryptEventIfNeeded(event: MatrixEvent, room?: Room, updatePendingStatus = true): Promise<void> {
         // If the room is unknown, we cannot encrypt for it
         if (!room) return;
 
@@ -3016,7 +3032,9 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             throw new Error("This room is configured to use encryption, but your client does not support encryption.");
         }
 
-        this.updatePendingEventStatus(room, event, EventStatus.ENCRYPTING);
+        if (updatePendingStatus) {
+            this.updatePendingEventStatus(room, event, EventStatus.ENCRYPTING);
+        }
         await this.cryptoBackend.encryptEvent(event, room);
     }
 
@@ -3557,7 +3575,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             roomId,
             threadId,
             eventObject: { type: eventType, content },
-            queryDict: { "org.matrix.msc4354.sticky_duration_ms": stickDuration },
+            queryDict: { [UNSTABLE_MSC4354_STICKY_DURATION_QUERY_PARAM]: stickDuration },
             delayOpts,
             txnId,
         });
@@ -3626,7 +3644,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             roomId,
             threadId,
             eventObject: { type: eventType, content },
-            queryDict: { "org.matrix.msc4354.sticky_duration_ms": stickDuration },
+            queryDict: { [UNSTABLE_MSC4354_STICKY_DURATION_QUERY_PARAM]: stickDuration },
             txnId,
         });
     }
@@ -8994,6 +9012,13 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         logger.error("Issuer configuration not valid");
         throw new Error(OAuth2Error.OpSupport);
     }
+}
+
+/**
+ * Whether the query parameters mark the event as a sticky event (MSC4354).
+ */
+function isStickyEventQuery(queryDict?: QueryDict): boolean {
+    return queryDict !== undefined && UNSTABLE_MSC4354_STICKY_DURATION_QUERY_PARAM in queryDict;
 }
 
 function getUnstableDelayQueryOpts(delayOpts: SendDelayedEventRequestOpts): QueryDict {
